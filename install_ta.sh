@@ -227,28 +227,55 @@ class TerminalAssistant:
         }
         return context
     
+    def query_database(self, sql_query):
+        """Execute SQL query on the database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            results = cursor.fetchall()
+            conn.close()
+            return results
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
     def ask_ai(self, user_query):
         """Ask AI for command suggestions using DeepSeek API"""
         import requests
         
         context = self.get_context_for_ai()
         
-        system_prompt = f"""You are a helpful terminal assistant. The user is working on a Mac with zsh/bash.
+        system_prompt = f"""You are a helpful terminal assistant with access to the user's command history database.
+
+DATABASE SCHEMA:
+- command_history: id, command, working_directory, exit_code, timestamp, context, tags
+- ssh_hosts: id, hostname, username, port, key_path, last_used, usage_count
+- command_patterns: id, pattern_name, commands, description, usage_count
 
 Current context:
 - Working directory: {context['working_directory']}
 - Recent commands: {', '.join(context['recent_commands'][:5])}
 - Known SSH hosts: {', '.join([h['host'] for h in context['ssh_hosts'][:5]])}
 
-When the user asks for help:
-1. Provide the exact command they need
-2. Explain what it does briefly
-3. If there are options, suggest the best one
-4. Consider their command history patterns
+When the user asks about their command history (e.g., "show my last 5 ssh connections", "what git commands did I run"), respond with:
 
-Format your response as:
+SQL_QUERY: <the SQL query to run>
+EXPLANATION: <what the query does>
+
+For other general terminal questions, respond with:
 COMMAND: <the actual command>
 EXPLANATION: <brief explanation>
+
+Examples:
+User: "show me my last 5 ssh connections"
+Response:
+SQL_QUERY: SELECT command, timestamp FROM command_history WHERE command LIKE 'ssh %' ORDER BY timestamp DESC LIMIT 5
+EXPLANATION: This queries your Terminal Assistant database to show the last 5 SSH commands you ran with timestamps.
+
+User: "how do I compress a folder?"
+Response:
+COMMAND: tar -czf archive.tar.gz foldername
+EXPLANATION: Creates a compressed tar archive of the folder.
 """
         
         try:
@@ -270,7 +297,35 @@ EXPLANATION: <brief explanation>
             
             if response.status_code == 200:
                 result = response.json()
-                return result['choices'][0]['message']['content']
+                ai_response = result['choices'][0]['message']['content']
+                
+                # Check if AI wants to query the database
+                if "SQL_QUERY:" in ai_response:
+                    # Extract SQL query
+                    lines = ai_response.split('\n')
+                    sql_query = None
+                    for line in lines:
+                        if line.startswith("SQL_QUERY:"):
+                            sql_query = line.replace("SQL_QUERY:", "").strip()
+                            break
+                    
+                    if sql_query:
+                        # Execute the query
+                        query_results = self.query_database(sql_query)
+                        
+                        # Format results
+                        result_text = "\n📊 Query Results:\n\n"
+                        if isinstance(query_results, str):
+                            result_text += query_results
+                        elif query_results:
+                            for row in query_results:
+                                result_text += f"  {' | '.join(str(item) for item in row)}\n"
+                        else:
+                            result_text += "  No results found\n"
+                        
+                        return ai_response + "\n" + result_text
+                
+                return ai_response
             else:
                 return f"Error: API returned {response.status_code}"
         
