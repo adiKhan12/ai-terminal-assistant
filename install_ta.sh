@@ -92,45 +92,79 @@ class TerminalAssistant:
     
     def log_command(self, command, working_dir=None, exit_code=0, context=None):
         """Log a command to the database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        import time
+        max_retries = 3
         
-        cursor.execute("""
-            INSERT INTO command_history (command, working_directory, exit_code, context)
-            VALUES (?, ?, ?, ?)
-        """, (command, working_dir or os.getcwd(), exit_code, context))
-        
-        # Extract and store SSH hosts
-        if command.strip().startswith('ssh'):
-            self._extract_ssh_info(command)
-        
-        conn.commit()
-        conn.close()
-    
-    def _extract_ssh_info(self, command):
-        """Extract SSH connection info from command"""
-        parts = command.split()
-        if len(parts) < 2:
-            return
-        
-        # Parse ssh user@host or just host
-        target = parts[1]
-        username = None
-        hostname = target
-        
-        if '@' in target:
-            username, hostname = target.split('@', 1)
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO ssh_hosts (hostname, username, last_used, usage_count)
-            VALUES (?, ?, ?, COALESCE((SELECT usage_count FROM ssh_hosts WHERE hostname = ?) + 1, 1))
-        """, (hostname, username, datetime.now(), hostname))
-        
-        conn.commit()
-        conn.close()
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=10.0)
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    INSERT INTO command_history (command, working_directory, exit_code, context)
+                    VALUES (?, ?, ?, ?)
+                """, (command, working_dir or os.getcwd(), exit_code, context))
+                
+                # Extract and store SSH hosts
+                if command.strip().startswith('ssh'):
+                    self._extract_ssh_info_safe(command, conn)
+                
+                conn.commit()
+                conn.close()
+                break
+            except sqlite3.OperationalError as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.1)
+                else:
+                    pass  # Silent fail on last attempt
+            except Exception:
+                break
+
+    def _extract_ssh_info_safe(self, command, conn=None):
+        """Extract SSH info without opening new connection"""
+        try:
+            parts = command.strip().split()
+            if len(parts) < 2:
+                return
+            
+            target = parts[1] if not parts[1].startswith('-') else (parts[2] if len(parts) > 2 else None)
+            if not target:
+                return
+            
+            username = None
+            hostname = target
+            
+            if '@' in hostname:
+                username, hostname = hostname.split('@', 1)
+            
+            hostname = hostname.split(':')[0]
+            
+            should_close = False
+            if conn is None:
+                conn = sqlite3.connect(self.db_path, timeout=10.0)
+                should_close = True
+            
+            cursor = conn.cursor()
+            cursor.execute("SELECT usage_count FROM ssh_hosts WHERE hostname = ?", (hostname,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                cursor.execute("""
+                    UPDATE ssh_hosts 
+                    SET username = ?, last_used = ?, usage_count = usage_count + 1
+                    WHERE hostname = ?
+                """, (username, datetime.now(), hostname))
+            else:
+                cursor.execute("""
+                    INSERT INTO ssh_hosts (hostname, username, last_used, usage_count)
+                    VALUES (?, ?, ?, 1)
+                """, (hostname, username, datetime.now()))
+            
+            if should_close:
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
     
     def get_recent_commands(self, limit=50):
         """Get recent commands from history"""
@@ -344,21 +378,32 @@ if ! grep -q "Terminal Assistant Shell Integration" "$HOME/.zshrc" 2>/dev/null; 
     cat >> "$HOME/.zshrc" << 'EOFZSH'
 
 # Terminal Assistant Shell Integration
+# Terminal Assistant Shell Integration
 export TA_PATH="$HOME/.terminal_assistant/ta.py"
 
-function _ta_log_command() {
-    local exit_code=$?
-    local last_cmd=$(fc -ln -1)
-    
-    if [[ ! "$last_cmd" =~ ^ta\ .* ]] && [[ -n "$last_cmd" ]]; then
-        (python3 "$TA_PATH" log "$last_cmd" >/dev/null 2>&1 &)
-    fi
-    
-    return $exit_code
+# Load the hook system first
+autoload -U add-zsh-hook
+
+# NOW remove any existing hooks to prevent duplicates
+add-zsh-hook -D preexec _ta_preexec_log
+add-zsh-hook -D precmd _ta_precmd_log
+
+# Capture command BEFORE it runs
+function _ta_preexec_log() {
+    _TA_LAST_CMD="$1"
 }
 
-autoload -U add-zsh-hook
-add-zsh-hook precmd _ta_log_command
+# Log after completion (only once)
+function _ta_precmd_log() {
+    if [[ -n "$_TA_LAST_CMD" ]] && [[ ! "$_TA_LAST_CMD" =~ ^ta\ .* ]]; then
+        (python3 "$TA_PATH" log "$_TA_LAST_CMD" >/dev/null 2>&1 &)
+    fi
+    unset _TA_LAST_CMD
+}
+
+# Add hooks
+add-zsh-hook preexec _ta_preexec_log
+add-zsh-hook precmd _ta_precmd_log
 
 alias ta="python3 $TA_PATH"
 
